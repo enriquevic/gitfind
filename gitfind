@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# gitfind (GitFind) - busca repositorios e codigo no GitHub direto do terminal.
+# Requer: gh (autenticado). Opcional: fzf (modo interativo).
+#
+# A busca de repositorios roda VARIAS estrategias em paralelo (nome/descricao,
+# README, topico, variante traduzida) e funde os rankings com Reciprocal Rank
+# Fusion. Um repo que aparece bem em varias listas sobe; um que aparece so numa
+# desce. E' o mesmo metodo usado em busca hibrida (lexica + vetorial).
+
+set -uo pipefail
+
+C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+C_YEL=$'\033[33m';  C_CYA=$'\033[36m'; C_GRN=$'\033[32m'; C_MAG=$'\033[35m'
+C_RED=$'\033[31m'
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitfind"
+CACHE_TTL="${GITFIND_CACHE_TTL:-600}"        # 10 min
+RRF_K="${GITFIND_RRF_K:-10}"                 # constante do RRF (baixa: listas curtas)
+STAR_W="${GITFIND_STAR_WEIGHT:-0.008}"       # peso do log10(estrelas)
+# peso por estrategia: topico e' o sinal mais forte, readme o mais ruidoso.
+W_T="${GITFIND_W_TOPIC:-1.3}"; W_N="${GITFIND_W_NAME:-1.0}"
+W_E="${GITFIND_W_EN:-0.9}";    W_R="${GITFIND_W_README:-0.6}"
+W_S="${GITFIND_W_TOPSTAR:-0.8}"  # so o topico, ordenado por estrelas
+
+usage() {
+  cat <<'USAGE'
+gitfind - busca no GitHub sem sair do terminal
+
+  gitfind <tema>                  busca repositorios (multi-estrategia)
+  gitfind -c <trecho>             busca dentro do codigo-fonte
+  gitfind -T <tema>               descobre topicos do GitHub sobre um tema
+
+Busca por tema:
+  -t, --topic <t1,t2>     fixa o topico (pula a descoberta automatica)
+  -m, --match <campo>     restringe a name, description ou readme
+  -S, --sort <campo>      stars, updated ou forks
+  -1, --simple            uma consulta so, sem fusao (comportamento cru do gh)
+  -x, --exact             FRASE EXATA: so traz quem contem exatamente o que voce
+                          digitou, na mesma ordem. Desliga traducao e topico.
+  -p, --page <n>          pagina de resultados (1, 2, 3...). Combina com -n.
+
+Filtros:
+  -l, --language <lang>   linguagem (python, abap, go...)
+  -s, --stars <expr>      estrelas: ">100", "50..500"
+  -u, --user <user>       limita a um usuario ou organizacao
+  -n, --limit <n>         resultados por estrategia (padrao 30)
+      --no-cache          ignora o cache de 10 min
+  -P, --porcelain         saida TSV sem cor, para scripts e para a GUI
+  -v, --verbose           mostra as estrategias e quantos resultados cada uma deu
+  -h, --help              esta ajuda
+
+Coluna de origem (por que o repo apareceu):
+  N nome/descricao   R readme   T topico+texto   S top do topico   E traduzido
+  Mais letras = achado por mais caminhos = mais confiavel.
+
+Acoes (modo fzf):
+  enter clonar (repos) / abrir (codigo) | ctrl-o navegador
+  ctrl-y copiar url | ctrl-d imprimir url | tab marcar varios
+
+Exemplos:
+  gitfind "analise de dados SAP"        # portugues funciona: ele traduz
+  gitfind "data pipeline" -t airflow
+  gitfind -T sap                        # ver topicos antes de filtrar
+  gitfind -c "SELECT SINGLE" -l abap
+  gitfind -x "terminal dashboard"       # so quem tem a frase exata
+  gitfind "rest api" -n 20 -p 3         # resultados 41 a 60
+USAGE
+}
+
+MODE=repos; LIMIT=30; SIMPLE=0; VERBOSE=0; USE_CACHE=1; PORCELAIN=0
+EXACT=0; PAGE=1
+QUERY=(); GHFLAGS=(); FIXED_TOPIC=""
+
+while (($#)); do
+  case "$1" in
+    -c|--code)     MODE=code; shift ;;
+    -T|--topics)   MODE=topics; shift ;;
+    -r|--repos)    MODE=repos; shift ;;
+    -1|--simple)   SIMPLE=1; shift ;;
+    -x|--exact)    EXACT=1; shift ;;
+    -p|--page)     [[ -n ${2:-} ]] || die "falta o valor de $1"; PAGE="$2"; shift 2 ;;
+    -v|--verbose)  VERBOSE=1; shift ;;
+    -P|--porcelain) PORCELAIN=1; shift ;;
+    --no-cache)    USE_CACHE=0; shift ;;
+    -t|--topic)    [[ -n ${2:-} ]] || die "falta o valor de $1"; FIXED_TOPIC="$2"; shift 2 ;;
+    -m|--match)    [[ -n ${2:-} ]] || die "falta o valor de $1"; GHFLAGS+=("--match=$2"); SIMPLE=1; shift 2 ;;
+    -S|--sort)     [[ -n ${2:-} ]] || die "falta o valor de $1"; GHFLAGS+=("--sort=$2"); shift 2 ;;
+    -l|--language) [[ -n ${2:-} ]] || die "falta o valor de $1"; GHFLAGS+=("--language=$2"); shift 2 ;;
+    -s|--stars)    [[ -n ${2:-} ]] || die "falta o valor de $1"; GHFLAGS+=("--stars=$2"); shift 2 ;;
+    -u|--user|-o|--org) [[ -n ${2:-} ]] || die "falta o valor de $1"; GHFLAGS+=("--owner=$2"); shift 2 ;;
+    -n|--limit)    [[ -n ${2:-} ]] || die "falta o valor de $1"; LIMIT="$2"; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; GHFLAGS+=("$@"); break ;;
+    -*)            GHFLAGS+=("$1"); shift ;;
+    *)             QUERY+=("$1"); shift ;;
+  esac
+done
+
+command -v gh >/dev/null || die "gh nao encontrado. Instale o GitHub CLI primeiro."
+((${#QUERY[@]})) || { usage; exit 1; }
+gh auth status >/dev/null 2>&1 || die "gh nao autenticado. Rode: gh auth login"
+
+Q="${QUERY[*]}"
+[[ $PAGE =~ ^[0-9]+$ ]] && ((PAGE >= 1)) || die "pagina invalida: $PAGE"
+# pool fixo de 100 por estrategia: paginas rasas fundem exatamente o mesmo
+# conjunto, entao o ranking nao muda quando voce avanca e volta. Custa o mesmo
+# numero de requisicoes (o gh busca 100 por pagina da API).
+FETCH=$(( LIMIT * PAGE )); ((FETCH < 100)) && FETCH=100; ((FETCH > 1000)) && FETCH=1000
+PG_FROM=$(( (PAGE-1)*LIMIT + 1 )); PG_TO=$(( PAGE*LIMIT ))
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+# ---------- cache ----------
+ckey() { printf '%s\0' "$@" | md5sum | cut -d' ' -f1; }
+cget() {
+  ((USE_CACHE)) || return 1
+  local f="$CACHE_DIR/$1"; [[ -f $f ]] || return 1
+  (( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) < CACHE_TTL )) || return 1
+  cat "$f"
+}
+cput() { mkdir -p "$CACHE_DIR" 2>/dev/null && cat > "$CACHE_DIR/$1"; }
+
+gh_err() {  # traduz os erros mais comuns do gh
+  local e="$1"
+  if grep -qi "rate limit\|API rate" <<<"$e"; then
+    printf '%slimite de requisicoes do GitHub atingido.%s A busca tem cota propria\n' "$C_RED" "$C_RESET" >&2
+    printf 'e apertada (~30/min). Espere um minuto, ou use o cache (sem --no-cache).\n' >&2
+  elif grep -qi "401\|authentication" <<<"$e"; then
+    printf '%sfalha de autenticacao.%s Rode: gh auth login\n' "$C_RED" "$C_RESET" >&2
+  elif [[ -n $e ]]; then
+    printf '%s\n' "$e" >&2
+  fi
+}
+
+# ---------- normalizacao da consulta ----------
+# tira acentos e stopwords pt/en; palavras de conteudo sao preservadas.
+strip_accents() { printf '%s' "$1" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$1"; }
+
+STOPWORDS=" de da do das dos em no na nos nas para por com e o a os as um uma que ao aos "
+STOPWORDS+=" the of in for and to with on at an is "
+
+clean_terms() {
+  local out=() w
+  for w in $(strip_accents "$1"); do
+    local lw="${w,,}"
+    [[ $STOPWORDS == *" $lw "* ]] && continue
+    out+=("$w")
+  done
+  printf '%s' "${out[*]}"
+}
+
+# glossario pt->en dos termos tecnicos mais comuns
+declare -A PTEN=(
+  [analise]=analysis [analises]=analysis [dados]=data [sistema]=system
+  [sistemas]=system [busca]=search [relatorio]=report [relatorios]=reports
+  [integracao]=integration [gestao]=management [gerenciamento]=management
+  [financeiro]=financial [estoque]=inventory [vendas]=sales [compras]=purchasing
+  [nota]=invoice [fiscal]=invoice [cadastro]=registration [usuario]=user
+  [usuarios]=users [pedido]=order [pedidos]=orders [cliente]=customer
+  [clientes]=customers [produto]=product [produtos]=products [pagamento]=payment
+  [pagamentos]=payments [banco]=database [seguranca]=security [rede]=network
+  [arquivo]=file [arquivos]=files [planilha]=spreadsheet [grafico]=chart
+  [graficos]=charts [painel]=dashboard [fluxo]=workflow [processo]=process
+  [contabil]=accounting [contabilidade]=accounting [folha]=payroll
+  [aprendizado]=learning [maquina]=machine [imagem]=image [imagens]=images
+  [texto]=text [treinamento]=training [modelo]=model [modelos]=models
+)
+
+translate_terms() {
+  local out=() w changed=0
+  for w in $1; do
+    local lw="${w,,}"
+    if [[ -n ${PTEN[$lw]:-} ]]; then out+=("${PTEN[$lw]}"); changed=1
+    else out+=("$w"); fi
+  done
+  ((changed)) && printf '%s' "${out[*]}"
+}
+
+# ---------- modo: descoberta de topicos ----------
+topics_for() {  # imprime nomes de topicos, um por linha
+  local k; k=$(ckey topics "$1")
+  local t; t=$(cget "$k") || {
+    t=$(gh api -X GET search/topics -f q="$1" \
+          --jq '.items[] | [.name, (.short_description // .display_name // "")] | @tsv' 2>/dev/null)
+    [[ -n $t ]] && printf '%s' "$t" | cput "$k"
+  }
+  printf '%s' "$t"
+}
+
+topic_count() {  # quantos repos tem esse topico (com cache)
+  local k; k=$(ckey topiccount "$1")
+  local c; c=$(cget "$k") || {
+    c=$(gh api -X GET search/repositories -f q="topic:$1" -f per_page=1 \
+          --jq '.total_count' 2>/dev/null)
+    [[ -n $c ]] && printf '%s' "$c" | cput "$k"
+  }
+  printf '%s' "${c:-0}"
+}
+
+if [[ $MODE == topics ]]; then
+  t=$(topics_for "$Q")
+  [[ -n $t ]] || die "Nenhum topico encontrado para: $Q"
+  ((PORCELAIN)) && { printf '%s\n' "$t"; exit 0; }
+  printf '%stopicos relacionados a "%s":%s\n\n' "$C_BOLD" "$Q" "$C_RESET"
+  LC_ALL=C awk -F'\t' -v R="$C_RESET" -v G="$C_GRN" -v D="$C_DIM" '
+    { d=$2; if (d=="") d="(sem descricao)"; if (length(d)>60) d=substr(d,1,57) "..."
+      printf "  %s%-26s%s %s%s%s\n", G, $1, R, D, d, R }' <<<"$t"
+  printf '\n%sfiltre com:%s gitfind <palavras> -t %s\n' \
+         "$C_DIM" "$C_RESET" "$(head -1 <<<"$t" | cut -f1)"
+  exit 0
+fi
+
+# ---------- uma consulta de repos -> TSV ----------
+REPO_JSON=fullName,stargazersCount,language,description,updatedAt
+REPO_JQ='.[] | [.fullName, (.stargazersCount|tostring),
+                ((.language // "") | if . == "" then "-" else . end),
+                (.updatedAt // "" | split("T")[0]),
+                ((.description // "") | gsub("[\n\r\t]"; " ")
+                 | if . == "" then "sem descricao" else . end)] | @tsv'
+
+query_repos() {  # query_repos <arquivo-saida> <termos> [flags extras...]
+  local out="$1" q="$2"; shift 2
+  local -a qarg=(); [[ -n ${q// } ]] && qarg=("$q")
+  local k; k=$(ckey repos "$q" "$FETCH" "$@" "${GHFLAGS[@]:-}")
+  local r
+  if r=$(cget "$k"); then printf '%s' "$r" > "$out"; return 0; fi
+  local err
+  err=$(mktemp)
+  r=$(gh search repos "${qarg[@]}" --limit "$FETCH" "$@" "${GHFLAGS[@]:-}" \
+        --json "$REPO_JSON" --jq "$REPO_JQ" 2>"$err")
+  local rc=$?
+  ((rc == 0)) && { printf '%s' "$r" > "$out"; printf '%s' "$r" | cput "$k"; } \
+              || { GH_LAST_ERR=$(cat "$err"); }
+  rm -f "$err"; return $rc
+}
+
+# ---------- busca de codigo ----------
+if [[ $MODE == code ]]; then
+  err=$(mktemp)
+  cq="$Q"; ((EXACT)) && cq="\"$Q\""
+  raw=$(gh search code "$cq" --limit "$FETCH" "${GHFLAGS[@]:-}" \
+        --json path,repository,url \
+        --jq '.[] | [.repository.nameWithOwner, .path] | @tsv' 2>"$err") || {
+    gh_err "$(cat "$err")"; rm -f "$err"; exit 1; }
+  rm -f "$err"
+  raw=$(sed -n "${PG_FROM},${PG_TO}p" <<<"$raw")
+  [[ -n $raw ]] || die "Nenhum resultado na pagina $PAGE para: $Q"
+  lines=$(LC_ALL=C awk -F'\t' -v R="$C_RESET" -v B="$C_BOLD" -v C="$C_CYA" '
+    { printf "%s\t%s\t%s%-34s%s %s%s%s\n", $1, $2, B, $1, R, C, $2, R }' <<<"$raw")
+
+# ---------- busca de repos ----------
+else
+  terms=$(clean_terms "$Q")
+  [[ -n $terms ]] || terms="$Q"
+  entr=$(translate_terms "$terms")
+
+  declare -a PLAN=()   # "tag<TAB>termos<TAB>flags"
+  if ((EXACT)); then
+    PLAN+=("N	\"$Q\"	")
+    PLAN+=("R	\"$Q\"	--match=readme")
+  elif ((SIMPLE)); then
+    PLAN+=("N	$terms	")
+  else
+    PLAN+=("N	$terms	")
+    [[ -n $entr && $entr != "$terms" ]] && PLAN+=("E	$entr	")
+    PLAN+=("R	${entr:-$terms}	--match=readme")
+    # topico: o fixado, ou o primeiro que o GitHub reconhecer para o tema
+    topic="$FIXED_TOPIC"
+    if [[ -z $topic ]]; then
+      best=0
+      for w in $terms; do
+        (( ${#w} >= 3 )) || continue
+        cand=$(topics_for "$w" | head -1 | cut -f1)
+        [[ -n $cand && ${cand,,} == "${w,,}"* ]] || continue
+        c=$(topic_count "$cand")
+        if (( c > best )); then best=$c; topic="$cand"; fi
+      done
+      ((VERBOSE)) && [[ -n $topic ]] && \
+        printf '%stopico escolhido: %s (%s repos)%s\n' "$C_DIM" "$topic" "$best" "$C_RESET" >&2
+    fi
+    if [[ -n $topic ]]; then
+      # tira do texto a palavra que virou topico, para nao restringir duas vezes
+      rest=$(tr ' ' '\n' <<<"${entr:-$terms}" | grep -viF -- "${topic%%-*}" | tr '\n' ' ')
+      PLAN+=("T	${rest% }	--topic=$topic --sort=stars")
+      PLAN+=("S		--topic=$topic --sort=stars")   # os maiores do topico, sem filtro de texto
+    fi
+  fi
+  [[ -n ${FIXED_TOPIC} ]] && ((SIMPLE)) && GHFLAGS+=("--topic=$FIXED_TOPIC")
+
+  # dispara todas as estrategias em paralelo
+  i=0
+  for p in "${PLAN[@]}"; do
+    tag=$(cut -f1 <<<"$p"); qt=$(cut -f2 <<<"$p"); fl=$(cut -f3 <<<"$p")
+    [[ -n ${qt// } || $fl == *--topic* ]] || continue
+    query_repos "$TMP/s_$tag.tsv" "$qt" $fl &
+    i=$((i+1))
+  done
+  wait
+
+  ((VERBOSE)) && {
+    printf '%sestrategias:%s\n' "$C_DIM" "$C_RESET" >&2
+    for p in "${PLAN[@]}"; do
+      tag=$(cut -f1 <<<"$p"); qt=$(cut -f2 <<<"$p"); fl=$(cut -f3 <<<"$p")
+      n=0; [[ -s $TMP/s_$tag.tsv ]] && n=$(wc -l < "$TMP/s_$tag.tsv")
+      printf '  %s%s%s  %-34s %-28s %s%d resultados%s\n' \
+        "$C_GRN" "$tag" "$C_RESET" "${qt:-(so topico)}" "$fl" "$C_DIM" "$n" "$C_RESET" >&2
+    done; printf '\n' >&2
+  }
+
+  found=$(cat "$TMP"/s_*.tsv 2>/dev/null | grep -c . || true)
+  if [[ ${found:-0} -eq 0 ]]; then
+    gh_err "${GH_LAST_ERR:-}"
+    die "Nenhum resultado para: $Q  (tente menos palavras, ou 'gitfind -T <tema>')"
+  fi
+
+  # ---------- fusao dos rankings (RRF) ----------
+  merged=$(LC_ALL=C awk -F'\t' -v OFS='\t' -v K="$RRF_K" -v SW="$STAR_W" \
+      -v WT="$W_T" -v WN="$W_N" -v WE="$W_E" -v WR="$W_R" -v WS="$W_S" '
+    BEGIN { w["T"]=WT; w["N"]=WN; w["E"]=WE; w["R"]=WR; w["S"]=WS }
+    FNR==1 { tag=FILENAME; sub(/.*s_/,"",tag); sub(/\.tsv$/,"",tag)
+             wt = (tag in w) ? w[tag] : 1 }
+    NF>=5 {
+      k=$1
+      score[k] += wt/(K+FNR)
+      if (!(k in seen)) { seen[k]=1; st[k]=$2; lg[k]=$3; dt[k]=$4; ds[k]=$5; ord[++n]=k }
+      if (index(tg[k], tag)==0) tg[k]=tg[k] tag
+    }
+    END {
+      for (j=1; j<=n; j++) { k=ord[j]
+        s = score[k] + SW*log(1+st[k])/log(10)
+        printf "%.8f\t%s\t%s\t%s\t%s\t%s\t%s\n", s, k, st[k], lg[k], dt[k], tg[k], ds[k]
+      }
+    }' "$TMP"/s_*.tsv | sort -rn -k1,1 | sed -n "${PG_FROM},${PG_TO}p")
+
+  [[ -n $merged ]] || die "Nada na pagina $PAGE (a busca tem menos resultados)"
+  lines=$(LC_ALL=C awk -F'\t' -v R="$C_RESET" -v D="$C_DIM" -v B="$C_BOLD" \
+              -v Y="$C_YEL" -v G="$C_GRN" -v M="$C_MAG" '
+    function human(n) {
+      if (n >= 1000000) return sprintf("%.1fM", n/1000000)
+      if (n >= 1000)    return sprintf("%.1fk", n/1000)
+      return n "" }
+    {
+      # $1 score  $2 repo  $3 stars  $4 lang  $5 data  $6 tags  $7 desc
+      tags=$6; gsub(/[^NERTS]/,"",tags)
+      desc=$7; if (length(desc) > 74) desc = substr(desc,1,71) "..."
+      printf "%s\t%s%-4s%s %s%7s%s  %s%-36s%s %s%-11s%s %s%s%s  %s%s%s\n", \
+             $2, M, tags, R, Y, "*" human($3), R, B, $2, R, G, $4, R, D, $5, R, D, desc, R
+    }' <<<"$merged")
+fi
+
+# ---------- helpers ----------
+copy_url() {
+  local u="$1" c
+  for c in wl-copy xclip xsel pbcopy; do
+    command -v "$c" >/dev/null || continue
+    case "$c" in
+      xclip) printf %s "$u" | xclip -selection clipboard ;;
+      xsel)  printf %s "$u" | xsel --clipboard --input ;;
+      *)     printf %s "$u" | "$c" ;;
+    esac
+    printf 'copiado: %s\n' "$u"; return
+  done
+  printf 'sem utilitario de clipboard; a URL e:\n%s\n' "$u"
+}
+open_url() { command -v xdg-open >/dev/null && xdg-open "$1" >/dev/null 2>&1 || printf '%s\n' "$1"; }
+
+act() {
+  local key="$1" line="$2" repo path url
+  repo=$(cut -f1 <<<"$line")
+  if [[ $MODE == repos ]]; then url="https://github.com/$repo"
+  else path=$(cut -f2 <<<"$line"); url="https://github.com/$repo/blob/HEAD/$path"; fi
+  case "$key" in
+    ctrl-o) open_url "$url" ;;
+    ctrl-y) copy_url "$url" ;;
+    ctrl-d) printf '%s\n' "$url" ;;
+    *) if [[ $MODE == repos ]]; then
+         printf '%sclonando %s...%s\n' "$C_MAG" "$repo" "$C_RESET"; gh repo clone "$repo"
+       else open_url "$url"; fi ;;
+  esac
+}
+
+if ((PORCELAIN)); then
+  if [[ $MODE == repos ]]; then cut -f2- <<<"$merged"; else printf '%s\n' "$raw"; fi
+  exit 0
+fi
+
+export GITFIND_QUERY="$Q"
+
+if command -v fzf >/dev/null && [[ -t 1 || -t 2 ]]; then
+  if [[ $MODE == repos ]]; then
+    preview='gh repo view {1} 2>/dev/null | head -200'
+    header="N nome/desc  R readme  T topico  E traduzido   |   enter clonar  ctrl-o navegador  ctrl-y copiar  ctrl-d url"
+    nth=2
+  else
+    preview='r={1}; f={2}; \
+             src=$(gh api -H "Accept: application/vnd.github.raw" "repos/$r/contents/$f" 2>/dev/null); \
+             printf "%s\\n" "$src" | grep -n -i -C 6 -m 5 -- "$GITFIND_QUERY" \
+             || printf "%s\\n" "$src" | head -60'
+    header="enter abrir  ctrl-o navegador  ctrl-y copiar  ctrl-d url"
+    nth=3
+  fi
+  out=$(printf '%s\n' "$lines" | fzf \
+        --ansi --multi --delimiter='\t' --with-nth="$nth" \
+        --preview="$preview" --preview-window='right,55%,border-left,wrap' \
+        --header="$header" --header-first \
+        --prompt="$MODE > " --pointer='>' \
+        --expect=ctrl-o,ctrl-y,ctrl-d)
+  [[ -n $out ]] || exit 0
+  key=$(head -1 <<<"$out")
+  while IFS= read -r sel; do [[ -n $sel ]] && act "$key" "$sel"; done < <(tail -n +2 <<<"$out")
+else
+  n=0
+  while IFS= read -r l; do
+    n=$((n+1))
+    printf '%s%3d%s %s\n' "$C_DIM" "$n" "$C_RESET" "$(cut -f2- <<<"$l")"
+  done <<<"$lines"
+  [[ -t 0 ]] || exit 0
+  command -v fzf >/dev/null || \
+    printf '\n%s(instale fzf para o modo interativo com preview)%s\n' "$C_DIM" "$C_RESET"
+  printf 'numero para %s, "u N" para so a URL, enter para sair: ' \
+         "$([[ $MODE == repos ]] && echo clonar || echo abrir)"
+  read -r choice || exit 0
+  [[ -n ${choice// } ]] || exit 0
+  key=""; num="$choice"
+  [[ $choice == u\ * ]] && { key=ctrl-d; num="${choice#u }"; }
+  [[ $num =~ ^[0-9]+$ ]] || die "entrada invalida"
+  sel=$(sed -n "${num}p" <<<"$lines")
+  [[ -n $sel ]] || die "numero fora da lista"
+  act "$key" "$sel"
+fi

@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""gitfind-gui - interface grafica GTK3 para o gitfind.
+
+Nao reimplementa a busca: chama `gitfind --porcelain` e mostra o resultado.
+CLI e GUI compartilham o mesmo motor, entao melhorias num aparecem no outro.
+"""
+import os
+import shlex
+import shutil
+import subprocess
+import threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+APP_ID = "org.roothub.gitfind"
+GITFIND = shutil.which("gitfind") or os.path.expanduser("~/.local/bin/gitfind")
+
+MODES = [("repos", "Repositórios"), ("code", "Código"), ("topics", "Tópicos")]
+
+TAG_HELP = {
+    "N": "nome/descrição", "R": "README", "T": "tópico + texto",
+    "S": "top do tópico", "E": "variante traduzida",
+}
+
+CSS = b"""
+textview { font-family: monospace; font-size: 10pt; }
+.tags { font-family: monospace; font-weight: bold; color: #9b59b6; }
+.dim  { opacity: 0.65; }
+"""
+
+
+def run(cmd, timeout=90):
+    """Executa e devolve (ok, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "tempo esgotado"
+    except FileNotFoundError:
+        return False, "", f"não encontrei: {cmd[0]}"
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="GitFind")
+        self.set_default_size(1180, 720)
+        self.busy = False
+        self.rows = []          # (chave1, chave2) por linha, para as ações
+        self.page = 1
+        self.last_count = 0
+        self.preview_token = 0
+
+        hb = Gtk.HeaderBar(show_close_button=True, title="GitFind",
+                           subtitle="busca de projetos e código no GitHub")
+        self.set_titlebar(hb)
+        self.spinner = Gtk.Spinner()
+        hb.pack_end(self.spinner)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_border_width(8)
+        self.add(root)
+
+        # ---------- linha de busca ----------
+        top = Gtk.Box(spacing=6)
+        self.entry = Gtk.SearchEntry(placeholder_text="tema, ex.: análise de dados SAP")
+        self.entry.set_hexpand(True)
+        self.entry.connect("activate", self.on_search)
+        top.pack_start(self.entry, True, True, 0)
+
+        self.mode = Gtk.ComboBoxText()
+        for _, label in MODES:
+            self.mode.append_text(label)
+        self.mode.set_active(0)
+        self.mode.connect("changed", self.on_mode_changed)
+        top.pack_start(self.mode, False, False, 0)
+
+        self.f_exact = Gtk.CheckButton(label="Frase exata")
+        self.f_exact.set_tooltip_text(
+            "Traz só quem contém exatamente o que você digitou, na mesma ordem.\n"
+            "Desliga tradução, tópico e expansão de tema.")
+        self.f_exact.connect("toggled", lambda *_: self.on_search())
+        top.pack_start(self.f_exact, False, False, 0)
+
+        self.btn_search = Gtk.Button(label="Buscar")
+        self.btn_search.get_style_context().add_class("suggested-action")
+        self.btn_search.connect("clicked", self.on_search)
+        top.pack_start(self.btn_search, False, False, 0)
+        root.pack_start(top, False, False, 0)
+
+        # ---------- filtros ----------
+        exp = Gtk.Expander(label="Filtros")
+        fbox = Gtk.Box(spacing=6)
+        fbox.set_margin_top(6)
+
+        def field(label, width, placeholder=""):
+            b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            lb = Gtk.Label(label=label, xalign=0)
+            lb.get_style_context().add_class("dim")
+            e = Gtk.Entry(placeholder_text=placeholder)
+            e.set_width_chars(width)
+            e.connect("activate", self.on_search)
+            b.pack_start(lb, False, False, 0)
+            b.pack_start(e, False, False, 0)
+            fbox.pack_start(b, False, False, 0)
+            return e
+
+        self.f_lang = field("Linguagem", 12, "python")
+        self.f_topic = field("Tópico", 14, "sap")
+        self.f_stars = field("Estrelas", 10, ">100")
+        self.f_user = field("Usuário/org", 14, "")
+
+        b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        lb = Gtk.Label(label="Resultados", xalign=0)
+        lb.get_style_context().add_class("dim")
+        self.f_limit = Gtk.SpinButton.new_with_range(5, 100, 5)
+        self.f_limit.set_value(30)
+        b.pack_start(lb, False, False, 0)
+        b.pack_start(self.f_limit, False, False, 0)
+        fbox.pack_start(b, False, False, 0)
+
+        self.f_nocache = Gtk.CheckButton(label="ignorar cache")
+        self.f_nocache.set_valign(Gtk.Align.END)
+        fbox.pack_start(self.f_nocache, False, False, 6)
+
+        exp.add(fbox)
+        root.pack_start(exp, False, False, 0)
+
+        # ---------- resultados + preview ----------
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(660)
+        root.pack_start(paned, True, True, 0)
+
+        self.store = Gtk.ListStore(str, int, str, str, str, str)  # tags,stars,repo,lang,data,desc
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.connect("row-activated", self.on_row_activated)
+        self.tree.get_selection().connect("changed", self.on_select)
+
+        def col(title, idx, expand=False, ellipsize=False, mono=False):
+            r = Gtk.CellRendererText()
+            if ellipsize:
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            if mono:
+                r.set_property("family", "monospace")
+            c = Gtk.TreeViewColumn(title, r, text=idx)
+            c.set_sort_column_id(idx)
+            c.set_resizable(True)
+            if expand:
+                c.set_expand(True)
+            self.tree.append_column(c)
+            return c
+
+        self.c_tags = col("Origem", 0, mono=True)
+        self.c_stars = col("★", 1)
+        col("Repositório", 2)
+        self.c_lang = col("Ling.", 3)
+        self.c_date = col("Atualizado", 4)
+        col("Descrição", 5, expand=True, ellipsize=True)
+        self.c_stars.set_sort_order(Gtk.SortType.DESCENDING)
+
+        sw = Gtk.ScrolledWindow()
+        sw.add(self.tree)
+        paned.pack1(sw, True, False)
+
+        self.preview = Gtk.TextView(editable=False, cursor_visible=False,
+                                    wrap_mode=Gtk.WrapMode.NONE)
+        self.preview.set_left_margin(8)
+        self.preview.set_top_margin(8)
+        sw2 = Gtk.ScrolledWindow()
+        sw2.add(self.preview)
+        paned.pack2(sw2, True, False)
+
+        # ---------- rodape ----------
+        bottom = Gtk.Box(spacing=6)
+        self.status = Gtk.Label(label="pronto", xalign=0)
+        self.status.get_style_context().add_class("dim")
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        bottom.pack_start(self.status, True, True, 0)
+
+        self.btn_prev = Gtk.Button(label="◀")
+        self.btn_prev.set_tooltip_text("página anterior")
+        self.btn_prev.connect("clicked", self.on_prev)
+        self.lbl_page = Gtk.Label(label="pág. 1")
+        self.lbl_page.get_style_context().add_class("dim")
+        self.btn_next = Gtk.Button(label="▶")
+        self.btn_next.set_tooltip_text("próxima página")
+        self.btn_next.connect("clicked", self.on_next)
+        for w in (self.btn_prev, self.lbl_page, self.btn_next):
+            bottom.pack_start(w, False, False, 0)
+
+        for label, cb in (("Copiar URL", self.on_copy),
+                          ("Abrir no navegador", self.on_open),
+                          ("Clonar…", self.on_clone)):
+            btn = Gtk.Button(label=label)
+            btn.connect("clicked", cb)
+            bottom.pack_start(btn, False, False, 0)
+        root.pack_start(bottom, False, False, 0)
+
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.on_mode_changed(self.mode)
+        self.update_pager()
+
+    # ---------- estado ----------
+    def mode_key(self):
+        return MODES[self.mode.get_active()][0]
+
+    def set_busy(self, busy, msg=None):
+        self.busy = busy
+        self.btn_search.set_sensitive(not busy)
+        self.spinner.start() if busy else self.spinner.stop()
+        if msg:
+            self.status.set_text(msg)
+
+    def on_prev(self, *_):
+        if self.page > 1 and not self.busy:
+            self.page -= 1
+            self.on_search(keep_page=True)
+
+    def on_next(self, *_):
+        if not self.busy and self.last_count >= int(self.f_limit.get_value()):
+            self.page += 1
+            self.on_search(keep_page=True)
+
+    def update_pager(self):
+        limit = int(self.f_limit.get_value())
+        is_list = self.mode_key() in ("repos", "code")
+        self.lbl_page.set_text(f"pág. {self.page}" if is_list else "—")
+        self.btn_prev.set_sensitive(is_list and self.page > 1 and not self.busy)
+        self.btn_next.set_sensitive(
+            is_list and self.last_count >= limit and not self.busy)
+
+    def on_mode_changed(self, _):
+        m = self.mode_key()
+        is_repo = m == "repos"
+        for w in (self.f_topic, self.f_stars):
+            w.set_sensitive(is_repo)
+        self.f_lang.set_sensitive(m in ("repos", "code"))
+        self.c_tags.set_visible(is_repo)
+        self.c_stars.set_visible(is_repo)
+        self.c_lang.set_visible(is_repo)
+        self.c_date.set_visible(is_repo)
+        placeholder = {
+            "repos": "tema, ex.: análise de dados SAP",
+            "code": "trecho de código, ex.: def handle_webhook",
+            "topics": "tema para descobrir tópicos, ex.: sap",
+        }[m]
+        self.entry.set_placeholder_text(placeholder)
+        self.f_exact.set_sensitive(m in ("repos", "code"))
+        self.update_pager()
+
+    # ---------- busca ----------
+    def build_cmd(self):
+        q = self.entry.get_text().strip()
+        if not q:
+            return None
+        cmd = [GITFIND, "--porcelain", "-n", str(int(self.f_limit.get_value()))]
+        m = self.mode_key()
+        if m == "code":
+            cmd.append("-c")
+        elif m == "topics":
+            cmd.append("-T")
+        if m in ("repos", "code") and self.f_lang.get_text().strip():
+            cmd += ["-l", self.f_lang.get_text().strip()]
+        if m == "repos":
+            if self.f_topic.get_text().strip():
+                cmd += ["-t", self.f_topic.get_text().strip()]
+            if self.f_stars.get_text().strip():
+                cmd += ["-s", self.f_stars.get_text().strip()]
+        if self.f_user.get_text().strip():
+            cmd += ["-u", self.f_user.get_text().strip()]
+        if self.f_exact.get_active() and m in ("repos", "code"):
+            cmd.append("-x")
+        if m in ("repos", "code"):
+            cmd += ["-p", str(self.page)]
+        if self.f_nocache.get_active():
+            cmd.append("--no-cache")
+        cmd.append(q)
+        return cmd
+
+    def on_search(self, *_, keep_page=False):
+        if self.busy:
+            return
+        if not keep_page:
+            self.page = 1
+        cmd = self.build_cmd()
+        if not cmd:
+            self.status.set_text("digite algo para buscar")
+            return
+        self.set_busy(True, "buscando: " + " ".join(shlex.quote(c) for c in cmd[1:]))
+        mode = self.mode_key()
+        threading.Thread(target=self._search_worker, args=(cmd, mode), daemon=True).start()
+
+    def _search_worker(self, cmd, mode):
+        ok, out, err = run(cmd)
+        GLib.idle_add(self._search_done, ok, out, err, mode)
+
+    def _search_done(self, ok, out, err, mode):
+        self.store.clear()
+        self.rows.clear()
+        self.preview.get_buffer().set_text("")
+        if not ok:
+            self.last_count = 0
+            self.set_busy(False, "erro: " + (err.strip().splitlines() or ["falhou"])[-1])
+            self.update_pager()
+            return
+        n = 0
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            f = line.split("\t")
+            if mode == "repos" and len(f) >= 6:
+                repo, stars, lang, date, tags, desc = f[0], f[1], f[2], f[3], f[4], f[5]
+                self.store.append([tags, int(stars or 0), repo, lang, date, desc])
+                self.rows.append((repo, None))
+            elif mode == "code" and len(f) >= 2:
+                self.store.append(["", 0, f[0], "", "", f[1]])
+                self.rows.append((f[0], f[1]))
+            elif mode == "topics":
+                self.store.append(["", 0, f[0], "", "", f[1] if len(f) > 1 else ""])
+                self.rows.append((f[0], None))
+            else:
+                continue
+            n += 1
+        if n:
+            self.tree.set_cursor(Gtk.TreePath.new_first(), None, False)
+        self.last_count = n
+        first = (self.page - 1) * int(self.f_limit.get_value()) + 1
+        if n:
+            msg = f"{n} resultado(s) — itens {first} a {first + n - 1}"
+        else:
+            msg = "nenhum resultado nesta página"
+        self.set_busy(False, msg)
+        self.update_pager()
+        return False
+
+    # ---------- preview ----------
+    def current(self):
+        model, it = self.tree.get_selection().get_selected()
+        if not it:
+            return None
+        idx = model.get_path(it).get_indices()[0]
+        return self.rows[idx] if idx < len(self.rows) else None
+
+    def url_for(self, item):
+        repo, path = item
+        m = self.mode_key()
+        if m == "topics":
+            return f"https://github.com/topics/{repo}"
+        if path:
+            return f"https://github.com/{repo}/blob/HEAD/{path}"
+        return f"https://github.com/{repo}"
+
+    def on_select(self, _sel):
+        item = self.current()
+        if not item:
+            return
+        self.preview_token += 1
+        token = self.preview_token
+        m = self.mode_key()
+        if m == "topics":
+            self.preview.get_buffer().set_text(
+                f"Tópico: {item[0]}\n\nUse-o como filtro:\n  gitfind <palavras> -t {item[0]}\n\n"
+                f"Ou na aba Repositórios, campo Tópico.")
+            return
+        self.preview.get_buffer().set_text("carregando…")
+        threading.Thread(target=self._preview_worker, args=(item, m, token),
+                         daemon=True).start()
+
+    def _preview_worker(self, item, mode, token):
+        repo, path = item
+        if mode == "repos":
+            ok, out, err = run(["gh", "repo", "view", repo], timeout=30)
+        else:
+            ok, out, err = run(
+                ["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                 f"repos/{repo}/contents/{path}"], timeout=30)
+            if ok:
+                out = self._focus(out, self.entry.get_text().strip())
+        GLib.idle_add(self._preview_done, ok, out or err, token)
+
+    @staticmethod
+    def _focus(text, needle, ctx=8):
+        """Recorta o arquivo em volta da primeira ocorrencia do termo."""
+        lines = text.splitlines()
+        if needle:
+            low = needle.lower()
+            for i, l in enumerate(lines):
+                if low in l.lower():
+                    a, b = max(0, i - ctx), min(len(lines), i + ctx + 1)
+                    return "\n".join(f"{j+1:5d} {'>' if j == i else ' '} {lines[j]}"
+                                     for j in range(a, b))
+        return "\n".join(f"{j+1:5d}   {l}" for j, l in enumerate(lines[:80]))
+
+    def _preview_done(self, ok, text, token):
+        if token != self.preview_token:
+            return False       # chegou uma selecao mais nova
+        self.preview.get_buffer().set_text(text if ok else "(sem preview)")
+        return False
+
+    # ---------- acoes ----------
+    def on_row_activated(self, *_):
+        self.on_open()
+
+    def on_open(self, *_):
+        item = self.current()
+        if item:
+            Gtk.show_uri_on_window(self, self.url_for(item), Gdk.CURRENT_TIME)
+
+    def on_copy(self, *_):
+        item = self.current()
+        if not item:
+            return
+        url = self.url_for(item)
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(url, -1)
+        self.status.set_text("copiado: " + url)
+
+    def on_clone(self, *_):
+        item = self.current()
+        if not item or self.mode_key() == "topics":
+            self.status.set_text("selecione um repositório")
+            return
+        repo = item[0]
+        dlg = Gtk.FileChooserDialog(
+            title=f"Clonar {repo} em…", parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons("Cancelar", Gtk.ResponseType.CANCEL,
+                        "Clonar aqui", Gtk.ResponseType.ACCEPT)
+        dlg.set_current_folder(os.path.expanduser("~"))
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            dest = dlg.get_filename()
+            dlg.destroy()
+            self.set_busy(True, f"clonando {repo} em {dest}…")
+            threading.Thread(target=self._clone_worker, args=(repo, dest),
+                             daemon=True).start()
+        else:
+            dlg.destroy()
+
+    def _clone_worker(self, repo, dest):
+        target = os.path.join(dest, repo.split("/")[-1])
+        ok, out, err = run(["gh", "repo", "clone", repo, target], timeout=600)
+        GLib.idle_add(self.set_busy, False,
+                      f"clonado em {target}" if ok
+                      else "falha ao clonar: " + err.strip().splitlines()[-1][:120])
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        w = Window(self)
+        w.show_all()
+        w.c_tags.set_visible(True)
+        w.present()
+
+
+if __name__ == "__main__":
+    import sys
+    if not os.path.exists(GITFIND):
+        print("gitfind não encontrado em ~/.local/bin — instale-o primeiro.")
+        sys.exit(1)
+    sys.exit(App().run(sys.argv))

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GitFind
+GenericName=Busca no GitHub
+Comment=Busca projetos e código no GitHub por tema, tópico ou frase exata
+Exec=gitfind-gui
+Icon=system-search
+Terminal=false
+Categories=Development;IDE;
+Keywords=github;git;busca;search;code;repositorio;
+StartupNotify=true
