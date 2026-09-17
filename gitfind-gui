@@ -4,7 +4,9 @@
 Nao reimplementa a busca: chama `gitfind --porcelain` e mostra o resultado.
 CLI e GUI compartilham o mesmo motor, entao melhorias num aparecem no outro.
 """
+import html as htmlmod
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,8 +28,9 @@ TAG_HELP = {
 }
 
 CSS = b"""
-textview { font-family: monospace; font-size: 10pt; }
-.tags { font-family: monospace; font-weight: bold; color: #9b59b6; }
+/* o corpo e proporcional; monospace vem das tags de codigo */
+textview { font-size: 10.5pt; }
+.tags { font-family: monospace; font-weight: bold; }
 .dim  { opacity: 0.65; }
 """
 
@@ -165,9 +168,14 @@ class Window(Gtk.ApplicationWindow):
         paned.pack1(sw, True, False)
 
         self.preview = Gtk.TextView(editable=False, cursor_visible=False,
-                                    wrap_mode=Gtk.WrapMode.NONE)
-        self.preview.set_left_margin(8)
-        self.preview.set_top_margin(8)
+                                    wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.preview.set_left_margin(14)
+        self.preview.set_right_margin(14)
+        self.preview.set_top_margin(12)
+        self.preview.set_bottom_margin(24)
+        self.preview.set_pixels_above_lines(1)
+        self.preview.set_pixels_below_lines(1)
+        self._init_tags(self.preview.get_buffer())
         sw2 = Gtk.ScrolledWindow()
         sw2.add(self.preview)
         paned.pack2(sw2, True, False)
@@ -203,6 +211,10 @@ class Window(Gtk.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), prov,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        st = Gtk.Settings.get_default()
+        for prop in ("gtk-theme-name", "gtk-application-prefer-dark-theme"):
+            st.connect(f"notify::{prop}", self._on_theme_changed)
 
         self.on_mode_changed(self.mode)
         self.update_pager()
@@ -365,25 +377,40 @@ class Window(Gtk.ApplicationWindow):
         token = self.preview_token
         m = self.mode_key()
         if m == "topics":
-            self.preview.get_buffer().set_text(
-                f"Tópico: {item[0]}\n\nUse-o como filtro:\n  gitfind <palavras> -t {item[0]}\n\n"
-                f"Ou na aba Repositórios, campo Tópico.")
+            self.render_markdown(
+                f"## Tópico: {item[0]}\n\nUse-o como filtro:\n\n"
+                f"`gitfind <palavras> -t {item[0]}`\n\n"
+                f"Ou na aba **Repositórios**, campo *Tópico*.")
             return
-        self.preview.get_buffer().set_text("carregando…")
-        threading.Thread(target=self._preview_worker, args=(item, m, token),
+        self.render_plain("carregando…")
+        model, it = self.tree.get_selection().get_selected()
+        head = ""
+        if it and m == "repos":
+            head = (f"name:\t{model[it][2]}\n"
+                    f"description:\t{model[it][5]}\n--\n")
+        threading.Thread(target=self._preview_worker, args=(item, m, token, head),
                          daemon=True).start()
 
-    def _preview_worker(self, item, mode, token):
+    def _preview_worker(self, item, mode, token, head=""):
         repo, path = item
         if mode == "repos":
-            ok, out, err = run(["gh", "repo", "view", repo], timeout=30)
+            # `gh repo view` passa o README por um formatador printf e destroi
+            # todo "%20", "%3A"... A API devolve o markdown intacto.
+            ok, out, err = run(
+                ["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                 f"repos/{repo}/readme"], timeout=30)
+            if ok:
+                out = head + out
+            else:
+                ok, out, err = True, head + "\n*(este repositório não tem README)*", ""
+
         else:
             ok, out, err = run(
                 ["gh", "api", "-H", "Accept: application/vnd.github.raw",
                  f"repos/{repo}/contents/{path}"], timeout=30)
             if ok:
                 out = self._focus(out, self.entry.get_text().strip())
-        GLib.idle_add(self._preview_done, ok, out or err, token)
+        GLib.idle_add(self._preview_done, ok, out or err, token, mode)
 
     @staticmethod
     def _focus(text, needle, ctx=8):
@@ -398,11 +425,354 @@ class Window(Gtk.ApplicationWindow):
                                      for j in range(a, b))
         return "\n".join(f"{j+1:5d}   {l}" for j, l in enumerate(lines[:80]))
 
-    def _preview_done(self, ok, text, token):
+    def _preview_done(self, ok, text, token, mode="repos"):
         if token != self.preview_token:
             return False       # chegou uma selecao mais nova
-        self.preview.get_buffer().set_text(text if ok else "(sem preview)")
+        if not ok:
+            self.render_plain("(sem preview)")
+        elif mode == "repos":
+            self.render_markdown(text)
+        else:
+            self.render_plain(text)
         return False
+
+
+    # ---------- renderizacao de markdown ----------
+    # Cores fixas quebram em um dos dois temas. Detectamos a luminancia da cor
+    # de texto do proprio widget: texto claro => tema escuro.
+    PAL_LIGHT = dict(code_bg="#eceff4", code_fg="#a03306", block_bg="#f2f4f7",
+                     block_fg="#26323f", link="#0b66c3", quote="#5a6673",
+                     dim="#6b7683", rule="#c3ccd5", alert="#0b66c3")
+    PAL_DARK = dict(code_bg="#343b45", code_fg="#e8a06a", block_bg="#272c33",
+                    block_fg="#ccd4dd", link="#72b8f5", quote="#9aa6b3",
+                    dim="#8d98a5", rule="#4a525c", alert="#72b8f5")
+
+    def _on_theme_changed(self, *_):
+        self._apply_palette()
+        item = self.current()
+        if item:
+            self.on_select(self.tree.get_selection())
+
+    def _palette(self):
+        fg = self.preview.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        lum = 0.2126 * fg.red + 0.7152 * fg.green + 0.0722 * fg.blue
+        return self.PAL_DARK if lum > 0.5 else self.PAL_LIGHT
+
+    def _apply_palette(self, *_):
+        """(Re)pinta as tags conforme o tema atual. Chamado tambem ao troca-lo."""
+        p = self._palette()
+        b = self.preview.get_buffer().get_tag_table()
+        def setp(name, **kw):
+            tag = b.lookup(name)
+            if tag:
+                for k, v in kw.items():
+                    tag.set_property(k, v)
+        setp("code", background=p["code_bg"], foreground=p["code_fg"])
+        setp("codeblock", background=p["block_bg"], foreground=p["block_fg"])
+        setp("table", foreground=p["block_fg"])
+        setp("link", foreground=p["link"])
+        setp("quote", foreground=p["quote"])
+        setp("dim", foreground=p["dim"])
+        setp("rule", foreground=p["rule"])
+        setp("alert", foreground=p["alert"])
+
+    def _init_tags(self, buf):
+        """Cria as tags de formatacao uma vez; depois so se aplica."""
+        t = buf.create_tag
+        t("h1", weight=Pango.Weight.BOLD, scale=1.7,
+          pixels_above_lines=16, pixels_below_lines=8)
+        t("h2", weight=Pango.Weight.BOLD, scale=1.35,
+          pixels_above_lines=14, pixels_below_lines=6)
+        t("h3", weight=Pango.Weight.BOLD, scale=1.15,
+          pixels_above_lines=12, pixels_below_lines=4)
+        t("h4", weight=Pango.Weight.BOLD, pixels_above_lines=10)
+        t("bold", weight=Pango.Weight.BOLD)
+        t("italic", style=Pango.Style.ITALIC)
+        t("bolditalic", weight=Pango.Weight.BOLD, style=Pango.Style.ITALIC)
+        t("strike", strikethrough=True)
+        t("code", family="monospace", scale=0.92)
+        t("codeblock", family="monospace", scale=0.9, left_margin=26,
+          pixels_above_lines=0, pixels_below_lines=0)
+        t("link", underline=Pango.Underline.SINGLE)
+        t("quote", style=Pango.Style.ITALIC, left_margin=26)
+        t("alert", weight=Pango.Weight.BOLD)
+        t("li", left_margin=26)
+        t("li2", left_margin=46)
+        t("dim")
+        t("rule")
+        t("title", weight=Pango.Weight.BOLD, scale=1.5,
+          pixels_below_lines=2)
+        t("table", family="monospace", scale=0.9)
+        self._apply_palette()
+
+    # imagens de badge nao valem espaco no painel
+    _BADGE = re.compile(r"(shields\.io|badge|travis-ci|circleci|codecov|"
+                        r"appveyor|coveralls|snyk\.io|deploy\.workers)", re.I)
+
+    _REFDEF = re.compile(r"^\s{0,3}\[([^\]]+)\]:\s*<?([^\s>]+)>?\s*(?:\".*\")?\s*$")
+
+    _INLINE = re.compile(r"""
+          (?P<rimg>\[!\[(?P<rialt>[^\]]*)\]\[(?P<riref>[^\]]*)\]\]\[(?P<rlref>[^\]]*)\])
+        | (?P<rlink>\[(?P<rltext>[^\]]*)\]\[(?P<rref>[^\]]*)\])
+        | (?P<limg>\[!\[(?P<lialt>[^\]]*)\]\((?P<liimg>[^)\s]*)[^)]*\)\]
+             \((?P<liurl>[^)\s]*)[^)]*\))
+        | (?P<img>!\[(?P<ialt>[^\]]*)\]\((?P<iurl>[^)\s]*)[^)]*\))
+        | (?P<link>\[(?P<ltext>[^\]]*)\]\((?P<lurl>[^)\s]*)[^)]*\))
+        | (?P<code>`[^`\n]+`)
+        | (?P<bold>\*\*[^*\n]+\*\*|__[^_\n]+__)
+        | (?P<ital>\*[^*\s][^*\n]*\*|(?<![a-zA-Z0-9_])_[^_\s][^_\n]*_)
+        | (?P<strike>~~[^~\n]+~~)
+    """, re.X)
+
+    _HTML = re.compile(r"<[^>\n]{1,200}>")
+    _HTML_OPEN = re.compile(r"<[a-zA-Z/!][^>]*$")     # tag que abre e nao fecha
+    _HTML_CLOSE = re.compile(r"^[^<]*>")              # o fecho dela, linhas depois
+
+    def _plainify(self, t):
+        """Texto puro de uma celula: sem HTML, sem links, sem asteriscos."""
+        t = htmlmod.unescape(self._HTML.sub("", t))
+        t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+        t = re.sub(r"!?\[([^\]]*)\]\[[^\]]*\]", r"\1", t)
+        t = re.sub(r"(\*\*|__|~~|`)", "", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    @staticmethod
+    def _emit(buf, text, *tags):
+        if not text:
+            return
+        if tags:
+            buf.insert_with_tags_by_name(buf.get_end_iter(), text, *tags)
+        else:
+            buf.insert(buf.get_end_iter(), text)
+
+    def _inline(self, buf, line, *base, depth=0):
+        """Escreve uma linha aplicando negrito, italico, codigo e links.
+
+        Recorre: negrito pode conter link, link pode conter codigo, etc.
+        """
+        line = htmlmod.unescape(self._HTML.sub("", line))
+        if depth > 4:                     # guarda contra aninhamento patologico
+            self._emit(buf, line, *base)
+            return
+        pos = 0
+        for m in self._INLINE.finditer(line):
+            self._emit(buf, line[pos:m.start()], *base)
+            pos = m.end()
+            if m.group("rimg") is not None:
+                img = self._refs.get((m.group("riref") or "").lower(), "")
+                url = self._refs.get((m.group("rlref") or "").lower(), "")
+                if self._BADGE.search(img) or self._BADGE.search(url):
+                    continue
+                self._emit(buf, (m.group("rialt") or "").strip() or url,
+                           "link", *base)
+            elif m.group("rlink") is not None:
+                txt = (m.group("rltext") or "").strip()
+                ref = (m.group("rref") or "").lower() or txt.lower()
+                if self._BADGE.search(self._refs.get(ref, "")):
+                    continue
+                self._inline(buf, txt, "link", *base, depth=depth + 1)
+            elif m.group("limg") is not None:
+                img, url = m.group("liimg") or "", m.group("liurl") or ""
+                if self._BADGE.search(img) or self._BADGE.search(url):
+                    continue                      # badge clicavel: descarta
+                alt = (m.group("lialt") or "").strip()
+                self._emit(buf, alt or url, "link", *base)
+            elif m.group("img") is not None:
+                url, alt = m.group("iurl") or "", (m.group("ialt") or "").strip()
+                if self._BADGE.search(url):
+                    continue                      # badge: descarta
+                self._emit(buf, f"🖼 {alt or 'imagem'}", "dim", *base)
+            elif m.group("link") is not None:
+                txt = self._HTML.sub("", (m.group("ltext") or "")).strip()
+                if txt:
+                    self._inline(buf, txt, "link", *base, depth=depth + 1)
+                else:
+                    self._emit(buf, m.group("lurl"), "link", *base)
+            elif m.group("code") is not None:
+                self._emit(buf, m.group("code").strip("`"), "code", *base)
+            elif m.group("bold") is not None:
+                self._inline(buf, m.group("bold")[2:-2], "bold", *base,
+                             depth=depth + 1)
+            elif m.group("ital") is not None:
+                self._inline(buf, m.group("ital")[1:-1], "italic", *base,
+                             depth=depth + 1)
+            elif m.group("strike") is not None:
+                self._inline(buf, m.group("strike")[2:-2], "strike", *base,
+                             depth=depth + 1)
+        self._emit(buf, line[pos:], *base)
+
+    def render_markdown(self, md):
+        """Desenha o README no painel: cabecalhos, negrito, codigo, links."""
+        buf = self.preview.get_buffer()
+        buf.set_text("")
+        self.preview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+
+        lines = md.split("\n")
+
+        # definicoes de link por referencia: [ref]: https://... (e some da saida)
+        self._refs = {}
+        keep = []
+        for ln in lines:
+            mr = self._REFDEF.match(ln)
+            if mr:
+                self._refs[mr.group(1).lower()] = mr.group(2)
+            else:
+                keep.append(ln)
+        lines = keep
+
+        # cabecalho do `gh repo view`: name:/description: ate o separador --
+        if lines and lines[0].startswith("name:"):
+            head, rest = [], lines
+            for i, ln in enumerate(lines):
+                if ln.strip() == "--":
+                    head, rest = lines[:i], lines[i + 1:]
+                    break
+            for ln in head:
+                k, _, v = ln.partition("\t")
+                if k.startswith("name:"):
+                    self._emit(buf, v + "\n", "title")
+                elif v.strip():
+                    self._emit(buf, v + "\n", "dim")
+            self._emit(buf, "─" * 44 + "\n\n", "rule")
+            lines = rest
+
+        para = []
+
+        def flush(extra=()):
+            if para:
+                self._inline(buf, " ".join(para), *extra)
+                self._emit(buf, "\n", *extra)
+                para.clear()
+
+        in_code = False
+        fence_ch, fence_len = "", 0
+        in_list = False
+        html_open = False
+        prev_blank = True
+        for raw in lines:
+            raw = raw.rstrip()
+
+            # citacao: remove os ">" logo de cara. Se ficarem, uma cerca de
+            # codigo dentro de um blockquote nao e reconhecida como cerca.
+            mq = re.match(r"^(\s{0,3}(?:>\s?)+)(.*)$", raw)
+            quoted = bool(mq)
+            if mq:
+                raw = mq.group(2)
+            qt = ("quote",) if quoted else ()
+
+            ln = raw.rstrip()
+            bare = ln.lstrip()
+
+            # cerca de codigo. Guardamos o marcador porque READMEs aninham
+            # ```` por fora de ``` -- fechar em qualquer cerca embaralha tudo.
+            fm = re.match(r"(`{3,}|~{3,})", bare)
+            if fm:
+                mk = fm.group(1)
+                if not in_code:
+                    flush(qt); in_code, fence_ch, fence_len = True, mk[0], len(mk)
+                    continue
+                if mk[0] == fence_ch and len(mk) >= fence_len:
+                    in_code = False
+                    self._emit(buf, "\n")
+                    continue
+            if in_code:
+                self._emit(buf, ln + "\n", "codeblock")
+                continue
+
+            # bloco de codigo por indentacao (4 espacos), fora de lista.
+            # HTML indentado (ex.: <blockquote> com um tweet) nao e' codigo.
+            if (not in_list and re.match(r"(    |\t)\S", raw)
+                    and not bare.startswith(("<", "&"))):
+                flush(qt)
+                self._emit(buf, raw.expandtabs(4)[4:] + "\n", "codeblock")
+                continue
+
+            # tag HTML espalhada por varias linhas: engole ate o ">"
+            if html_open:
+                mc = self._HTML_CLOSE.match(bare)
+                if mc:
+                    html_open = False
+                    ln = bare[mc.end():]
+                    if not ln.strip():
+                        continue
+                else:
+                    continue
+            elif self._HTML_OPEN.search(bare):
+                ln = self._HTML_OPEN.sub("", bare)
+                html_open = True
+                if not ln.strip():
+                    continue
+
+            stripped = ln.strip()
+
+            if not stripped:
+                flush(qt)
+                if not prev_blank:
+                    self._emit(buf, "\n")
+                prev_blank = True
+                continue
+            prev_blank = False
+            if not raw[:1].isspace():
+                in_list = False          # linha na margem encerra a lista
+
+            # linha horizontal
+            if re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", stripped):
+                flush(qt)
+                self._emit(buf, "\u2500" * 44 + "\n", "rule")
+                continue
+
+            # cabecalho
+            m = re.match(r"(#{1,6})\s+(.*)", stripped)
+            if m:
+                flush(qt)
+                lvl = min(len(m.group(1)), 4)
+                self._inline(buf, m.group(2), f"h{lvl}")
+                self._emit(buf, "\n")
+                continue
+
+            # alerta do GitHub: > [!NOTE]
+            m = re.fullmatch(r"\[!(\w+)\]", stripped)
+            if m:
+                flush(qt)
+                self._emit(buf, m.group(1).capitalize() + "\n", "alert")
+                continue
+
+            # tabela markdown
+            if stripped.startswith("|") and stripped.endswith("|"):
+                flush(qt)
+                cells = [c.strip() for c in stripped.strip("|").split("|")]
+                if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                    continue                       # linha separadora
+                cells = [self._plainify(c) for c in cells]
+                self._emit(buf, "  ".join(f"{c[:22]:<22}" for c in cells).rstrip()
+                           + "\n", "table")
+                continue
+
+            # lista
+            m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)", raw)
+            if m:
+                flush(qt)
+                depth = len(m.group(1)) // 2
+                marker = "\u2022" if not m.group(2)[0].isdigit() else m.group(2)
+                tag = "li2" if depth else "li"
+                self._emit(buf, f"{marker} ", tag, *qt)
+                self._inline(buf, m.group(3), tag, *qt)
+                self._emit(buf, "\n", tag, *qt)
+                in_list = True
+                continue
+
+            # paragrafo comum (linha so de HTML vira nada, nao vira espaco em branco)
+            if not self._HTML.sub("", stripped).strip():
+                continue
+            para.append(stripped)
+
+        flush()
+
+    def render_plain(self, text):
+        buf = self.preview.get_buffer()
+        buf.set_text("")
+        self.preview.set_wrap_mode(Gtk.WrapMode.NONE)
+        self._emit(buf, text, "codeblock")
 
     # ---------- acoes ----------
     def on_row_activated(self, *_):

@@ -102,7 +102,13 @@ O conjunto fundido é fixo em 100 candidatos por estratégia, então o ranking n
 
 `gitfind-gui` não reimplementa nada — chama `gitfind --porcelain` e desenha o resultado. Um motor só, CLI e GUI sempre em sincronia.
 
-Três modos, filtros de linguagem/tópico/estrelas/usuário, colunas ordenáveis por clique e um painel de preview: o README no modo repositórios, e no modo código o arquivo real recortado em volta do termo buscado, com a linha marcada. Busca e preview rodam em thread separada, então a janela não trava.
+Três modos, filtros de linguagem/tópico/estrelas/usuário, colunas ordenáveis por clique, paginação e um painel de preview. Busca e preview rodam em thread separada, então a janela não trava.
+
+O preview **renderiza o Markdown** — títulos, negrito, itálico, código, listas, tabelas, citações e links — usando tags do `Gtk.TextBuffer`, sem depender de WebKit ou de um renderizador externo. Badges de build são descartados e entidades HTML decodificadas. No modo código, mostra o arquivo real recortado em volta do termo buscado, com a linha marcada.
+
+As cores saem do tema GTK em uso, detectado pela luminância da cor de texto do widget, e são repintadas se você trocar de tema com o programa aberto.
+
+Um detalhe que custou caro descobrir: `gh repo view` passa o README por um formatador estilo `printf` e destrói todo `%` das URLs (`Codequality%20Lints` vira `Codequality%!L(MISSING)ints`). Por isso o README vem de `gh api repos/OWNER/REPO/readme`, que devolve o markdown intacto.
 
 ## Limitações
 

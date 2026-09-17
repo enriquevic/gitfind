@@ -389,7 +389,11 @@ export GITFIND_QUERY="$Q"
 
 if command -v fzf >/dev/null && [[ -t 1 || -t 2 ]]; then
   if [[ $MODE == repos ]]; then
-    preview='gh repo view {1} 2>/dev/null | head -200'
+    # `gh repo view` passa o README por um formatador printf e destroi todo
+    # "%20"/"%3A" das URLs. A API devolve o markdown intacto.
+    preview='r={1}; gh api -H "Accept: application/vnd.github.raw" \
+             "repos/$r/readme" 2>/dev/null | head -200 \
+             || gh repo view "$r" 2>/dev/null | head -200'
     header="N nome/desc  R readme  T topico  E traduzido   |   enter clonar  ctrl-o navegador  ctrl-y copiar  ctrl-d url"
     nth=2
   else
