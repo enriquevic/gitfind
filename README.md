@@ -115,3 +115,7 @@ Um detalhe que custou caro descobrir: `gh repo view` passa o README por um forma
 A busca de código do GitHub exige autenticação e tem cota própria e apertada (~30 requisições por minuto). O cache de 10 minutos ajuda, mas rajadas de `-c` vão esbarrar no limite — o erro é repassado com uma mensagem explicando.
 
 Consultas que misturam um domínio com uma tarefa genérica ainda rendem menos que uma palavra-chave dentro de um tópico. Para "análise de dados em SAP", `gitfind analytics -t sap` traz resultados melhores que a frase inteira. A fusão melhorou muito o caso geral, mas não substitui escolher bem o termo.
+
+## Licença
+
+[MIT](LICENSE) — use, modifique e redistribua à vontade, mantendo o aviso de copyright.
